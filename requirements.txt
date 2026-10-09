@@ -1,0 +1,6 @@
+pandas
+numpy
+scikit-learn>=1.1
+boto3
+cryptography
+snowflake-connector-python[pandas]
