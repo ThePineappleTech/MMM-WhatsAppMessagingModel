@@ -592,6 +592,10 @@ WHERE NOT EXISTS (SELECT 1 FROM PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.CONTINUOU
 SELECT p.first_name, p.last_name, p.phone_number,
        p.audience,                                    
        p.offered_discount_percentage,
+       
+       
+       IFF(p.audience = ''L2S'', NULL,
+           FLOOR(p.offered_discount_percentage - COALESCE(p.prior_discount_percentage, 0) + 0.000001)) AS top_up_percentage,
        p.premium_without_any_discounts, p.last_quoted_premium, p.new_premium_offered,
        p.vehicle_make, p.vehicle_model,
        FALSE AS has_been_messaged,                    

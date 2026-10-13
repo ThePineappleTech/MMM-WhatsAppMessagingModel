@@ -16,12 +16,27 @@ model ranks people (0.5 = random, 1.0 = perfect).
 
 ---
 
+## 0. Getting started (new machine or reviewer)
+
+Needs: Windows with Python 3.12 (python.org, tick "Add python.exe to PATH"), and the two AWS keys
+that unlock the Snowflake key (ask the project owner; they are never stored in this folder).
+
+```powershell
+cd "<this folder>"
+powershell -ExecutionPolicy Bypass -File .\setup_env.ps1   # one time: creates .venv, installs exact versions, creates .env
+notepad .env                                                # paste the two AWS keys
+.\run.ps1 test_connection.py                                # packages, keys, Snowflake login, MMM tables
+```
+
+After that, run any script through `run.ps1` — it uses the folder's own Python, so nothing needs to be
+activated: `.\run.ps1 MMM_run_sql.py checks`, `.\run.ps1 MMM_auto_retrain.py --dry-run`.
+
 ## 1. How a day works
 
 | Time (SAST) | Who | What happens |
 |---|---|---|
 | 10:30 Mon–Sat | Snowflake task `MMM_DAILY_PICK_TASK` | Scores everyone eligible with the current champion model, holds back anyone who must not be messaged, picks the top 2 × `daily_n` (default 200), logs **every** pick in the ledger, and fills `SEND_TODAY` with the treated half (+ today's date). |
-| During the day | Make | Reads `CONTINUOUS_PUSH_CAMPAIGN_SEND_TODAY`, sends only if `selected_date` = today, picks the template from the `audience` column, and sets `has_been_messaged = TRUE` on every row it sent. |
+| During the day | Make | Reads the view `CONTINUOUS_PUSH_CAMPAIGN_SEND_NOW` (today's unsent rows, minus anyone who bought since 10:30), sends only if `selected_date` = today, picks the template from the `audience` column, and sets `has_been_messaged = TRUE` on every row it sent. |
 | 18:00 Mon–Sat | Snowflake task `MMM_CONFIRM_SENDS_TASK` | Writes a "sent" row to the ledger for every ticked row, then deletes those rows from `SEND_TODAY`. Rows left behind = picked but not sent (visible for checking). |
 | Monthly | You: `python MMM_auto_retrain.py` | Rebuilds the training data, retrains, compares with the live model, and promotes the new one only if it is at least as good. The next 10:30 run uses it automatically. |
 
@@ -35,8 +50,9 @@ logging also records the control group, which is never messaged but is needed fo
 |---|---|---|---|
 | `CONTINUOUS_PUSH_CAMPAIGN_AUDIENCE` | morning task | you (checks) | Everyone eligible today, scored, with discount, arm and hold flags. Rebuilt daily. |
 | `CONTINUOUS_PUSH_CAMPAIGN_PICKED_TODAY` | morning task | evening task | Today's 2 × `daily_n` picks (both arms). |
-| `CONTINUOUS_PUSH_CAMPAIGN_SEND_TODAY` | morning task; Make ticks rows; evening task deletes sent rows | Make | The list Make sends from. |
+| `CONTINUOUS_PUSH_CAMPAIGN_SEND_TODAY` | morning task; Make ticks rows; evening task deletes sent rows | Make | The list Make sends from: name, phone, `audience`, `offered_discount_percentage`, `top_up_percentage` (new discount minus last quote's discount, rounded down; NULL for L2S), premiums, vehicle, `has_been_messaged`, `selected_date`. |
 | `CONTINUOUS_PUSH_CAMPAIGN_HISTORY` | morning task (picks), evening task (sends) | cooldown, spam guard, retraining | **Append-only ledger.** Never recreated. |
+| `CONTINUOUS_PUSH_CAMPAIGN_SEND_NOW` (view) | — | **Make** | `SEND_TODAY` re-checked at the moment Make reads it: only today's unsent rows, minus anyone who has bought since the pick (policy created, golden sale, Sale Made outcome). |
 | `CONTINUOUS_PUSH_CAMPAIGN_DO_NOT_MESSAGE_7D` (view) | — | morning task, Make | Anyone who got a discount WhatsApp or was picked/sent in the last 7 days. |
 | `CPC_DISCOUNT_TEMPLATES` | you (one INSERT per new template) | spam guard, model features, retraining | The one place to register discount WhatsApp template IDs. |
 | `CPC_MODEL_WEIGHTS` | setup, retraining | morning task | One weight per (model, feature, level). |
@@ -264,7 +280,10 @@ go-live (14 Oct 2026).
 | `MMM_build_training_frame.sql` | **Yes** | Builds the training data; run automatically by the retrain. |
 | `MMM_train.py` | **Yes** | Features, both models, validation, calibration, weights export. Imported by the retrain; can also run alone on a CSV. |
 | `MMM_auto_retrain.py` | **Yes** | The monthly retrain: Snowflake in, Snowflake out, with the gate. |
-| `requirements.txt` | **Yes** | Python packages: `pip install -r requirements.txt`. |
+| `requirements.txt` | **Yes** | Exact Python package versions (installed by `setup_env.ps1`). |
+| `setup_env.ps1` | **Yes** | One-time setup: creates `.venv` in the folder, installs the packages, creates `.env` from the template. |
+| `run.ps1` | **Yes** | Runs any MMM script with the folder's own Python, no activation needed. |
+| `.env.example` | **Yes** | Template for `.env` (variable names, no values). |
 | `.env` | **Yes** (never share) | `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, only used to fetch the Snowflake key from S3. |
 | `MMM_run_sql.py` | Optional, recommended | Runs parts of the production SQL from Python (`setup`, `daily`, `confirm`, `checks`) — a fallback if a task fails — and `build-tasks`, which rewrites the procedures in `MMM_snowflake_tasks.sql` after you edit Parts 2–4. |
 | `test_connection.py` | Optional | One-command health check: packages, keys, Snowflake login, MMM tables. |
@@ -279,7 +298,7 @@ Not needed to run MMM (analysis history, can be archived): `cpc_batch3_training_
 ## 6. Runbook
 
 **First-time setup (done)**
-`pip install -r requirements.txt` → `python test_connection.py` → `python MMM_run_sql.py setup` →
+`setup_env.ps1` → fill in `.env` → `.\run.ps1 test_connection.py` → `.\run.ps1 MMM_run_sql.py setup` →
 run `MMM_snowflake_tasks.sql` in a worksheet (creates procedures, runs a score-only test, creates the
 tasks paused).
 
