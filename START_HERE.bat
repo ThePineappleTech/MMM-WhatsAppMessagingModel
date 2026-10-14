@@ -15,14 +15,23 @@ if not defined PY py -3 -c "import sys" >nul 2>nul && set "PY=py -3"
 if not defined PY python -c "import sys" >nul 2>nul && set "PY=python"
 if not defined PY goto :nopython
 
-rem ---- 2. First run: private Python environment + packages -----------
-if exist ".venv\Scripts\python.exe" goto :keys
+rem ---- 2. Private Python environment + packages ------------------------
+rem      First run: create it. Every run: if a package is missing (e.g. requirements.txt
+rem      changed since the last run), install the missing ones automatically.
+if exist ".venv\Scripts\python.exe" goto :checkpkgs
 echo.
 echo  First run: setting up MMM. This takes a few minutes and needs internet.
 echo.
 %PY% -m venv .venv
 if errorlevel 1 goto :fail
 ".venv\Scripts\python.exe" -m pip install --upgrade pip --quiet
+
+:checkpkgs
+".venv\Scripts\python.exe" -c "import pandas, numpy, sklearn, boto3, cryptography, snowflake.connector, dotenv" >nul 2>nul
+if not errorlevel 1 goto :keys
+echo.
+echo  Installing / updating packages ...
+echo.
 ".venv\Scripts\python.exe" -m pip install -r requirements.txt
 if errorlevel 1 goto :fail
 echo.
@@ -34,11 +43,12 @@ set "VPY=.venv\Scripts\python.exe"
 if exist ".env" goto :menu
 copy ".env.example" ".env" >nul
 echo.
-echo  Notepad will open the .env file. Paste the two AWS keys after the = signs,
-echo  save, and close Notepad. Ask the project owner for the keys.
+echo  Notepad is opening the .env file. Paste the two AWS keys after the = signs
+echo  and SAVE the file. Ask the project owner for the keys.
+start "" notepad ".env"
 echo.
-pause
-notepad ".env"
+echo  When the keys are saved, come back to this window and press any key.
+pause >nul
 
 rem ---- 4. Menu ---------------------------------------------------------
 :menu
@@ -65,7 +75,7 @@ if "%choice%"=="3" "%VPY%" MMM_auto_retrain.py --dry-run & goto :done
 if "%choice%"=="4" goto :retrain
 if "%choice%"=="5" "%VPY%" MMM_run_sql.py setup & goto :done
 if "%choice%"=="6" start "" "README.md" & goto :menu
-if "%choice%"=="7" notepad ".env" & goto :menu
+if "%choice%"=="7" start "" notepad ".env" & goto :menu
 if "%choice%"=="0" goto :eof
 goto :menu
 

@@ -1,6 +1,8 @@
-pandas
-numpy
-scikit-learn>=1.1
-boto3
-cryptography
-snowflake-connector-python[pandas]
+# Tested with Python 3.12 on Windows (Oct 2026). Install with:  pip install -r requirements.txt
+pandas==2.3.3
+numpy==2.5.3
+scikit-learn==1.9.1
+boto3==1.43.108
+cryptography==50.0.2
+snowflake-connector-python[pandas]==4.8.0
+python-dotenv==1.2.4
