@@ -18,18 +18,25 @@ model ranks people (0.5 = random, 1.0 = perfect).
 
 ## 0. Getting started (new machine or reviewer)
 
-Needs: Windows with Python 3.12 (python.org, tick "Add python.exe to PATH"), and the two AWS keys
-that unlock the Snowflake key (ask the project owner; they are never stored in this folder).
+1. Install **Python 3.12** from python.org — on the first installer screen tick **"Add python.exe to PATH"**.
+2. Unzip this folder anywhere (e.g. Documents).
+3. **Double-click `START_HERE.bat`.** The first time it creates a private Python environment in the
+   folder (`.venv`), installs the exact package versions, and opens `.env` in Notepad — paste the two
+   AWS keys there (ask the project owner; they are never shipped with the folder).
+4. Choose **1 — Check everything works**. When all lines say `ok`, you're set up.
 
-```powershell
-cd "<this folder>"
-powershell -ExecutionPolicy Bypass -File .\setup_env.ps1   # one time: creates .venv, installs exact versions, creates .env
-notepad .env                                                # paste the two AWS keys
-.\run.ps1 test_connection.py                                # packages, keys, Snowflake login, MMM tables
-```
+After that, double-clicking `START_HERE.bat` opens a menu:
 
-After that, run any script through `run.ps1` — it uses the folder's own Python, so nothing needs to be
-activated: `.\run.ps1 MMM_run_sql.py checks`, `.\run.ps1 MMM_auto_retrain.py --dry-run`.
+| Option | What it does |
+|---|---|
+| 1 Check everything works | Packages, AWS keys, Snowflake login, MMM tables |
+| 2 Daily health checks | Today's pool, picks and must-be-zero checks (Part 5) |
+| 3 Retrain — trial run | Trains and compares with the live model, writes nothing |
+| 4 Retrain — for real | Monthly retrain; publishes only if the new model passes the gate (asks you to type YES) |
+| 5 Set up Snowflake objects | Tables, registry, weights, views (Part 1) — safe to re-run |
+| 6 / 7 | Open this README / edit the AWS keys |
+
+The daily audience itself does **not** need this folder: it runs inside Snowflake on a schedule (section 1).
 
 ## 1. How a day works
 
@@ -280,9 +287,9 @@ go-live (14 Oct 2026).
 | `MMM_build_training_frame.sql` | **Yes** | Builds the training data; run automatically by the retrain. |
 | `MMM_train.py` | **Yes** | Features, both models, validation, calibration, weights export. Imported by the retrain; can also run alone on a CSV. |
 | `MMM_auto_retrain.py` | **Yes** | The monthly retrain: Snowflake in, Snowflake out, with the gate. |
-| `requirements.txt` | **Yes** | Exact Python package versions (installed by `setup_env.ps1`). |
-| `setup_env.ps1` | **Yes** | One-time setup: creates `.venv` in the folder, installs the packages, creates `.env` from the template. |
-| `run.ps1` | **Yes** | Runs any MMM script with the folder's own Python, no activation needed. |
+| `START_HERE.bat` | **Yes** | Double-click entry point: first-run setup (private `.venv`, packages, `.env`) and the menu. |
+| `requirements.txt` | **Yes** | Exact Python package versions (installed automatically by `START_HERE.bat`). |
+| `MMM_send_now_view.sql` | **Yes** | The `SEND_NOW` view on its own (also in Part 1 of the production SQL). |
 | `.env.example` | **Yes** | Template for `.env` (variable names, no values). |
 | `.env` | **Yes** (never share) | `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, only used to fetch the Snowflake key from S3. |
 | `MMM_run_sql.py` | Optional, recommended | Runs parts of the production SQL from Python (`setup`, `daily`, `confirm`, `checks`) — a fallback if a task fails — and `build-tasks`, which rewrites the procedures in `MMM_snowflake_tasks.sql` after you edit Parts 2–4. |
@@ -298,7 +305,7 @@ Not needed to run MMM (analysis history, can be archived): `cpc_batch3_training_
 ## 6. Runbook
 
 **First-time setup (done)**
-`setup_env.ps1` → fill in `.env` → `.\run.ps1 test_connection.py` → `.\run.ps1 MMM_run_sql.py setup` →
+`START_HERE.bat` → fill in `.env` → menu 1 (check) → menu 5 (Snowflake objects) →
 run `MMM_snowflake_tasks.sql` in a worksheet (creates procedures, runs a score-only test, creates the
 tasks paused).
 
