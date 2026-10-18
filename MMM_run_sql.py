@@ -105,12 +105,18 @@ def build_tasks():
     Session variables cannot be used inside procedures, so each statement becomes an EXECUTE IMMEDIATE
     string with $model_version / $daily_n / $cooldown_days replaced by procedure values."""
     parts = load_parts()
+    sql_text = open(SQL_FILE, encoding='utf-8').read()
+    # settings that are written into the procedures as plain numbers (from the SET lines at the top)
+    BAKED = {name: m.group(1) for name in ('max_prior_click_share', 'max_prev_sent_share', 'fresh_days')
+             for m in [re.search(r"SET\s+" + name + r"\s*=\s*([0-9.]+)", sql_text, flags=re.I)] if m}
     q = "'"
     MV = q * 3 + ' || mv || ' + q * 3            # ->  'MMM_vX'  inside the generated SQL
     DN = q + ' || P_DAILY_N::VARCHAR || ' + q
     CD = q + ' || P_COOLDOWN_DAYS::VARCHAR || ' + q
 
     def subst(text, mv, dn, cd):
+        for name, value in BAKED.items():
+            text = re.sub(r'\$' + name + r'\b', lambda _, v=value: v, text, flags=re.I)
         text = re.sub(r'\$model_version\b', lambda _: mv, text, flags=re.I)
         text = re.sub(r'\$daily_n\b', lambda _: dn, text, flags=re.I)
         return re.sub(r'\$cooldown_days\b', lambda _: cd, text, flags=re.I)

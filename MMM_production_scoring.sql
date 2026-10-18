@@ -9,7 +9,7 @@
    WhatsApp history is counted per MESSAGE (Twilio SID), not per status-event row.
 
    PART 1  One-time setup: weights table + ledger table              (run once)
-   PART 2  Daily build: continuous_push_campaign_audience            (daily, ~10:30)
+   PART 2  Daily build: continuous_push_campaign_audience            (daily, ~10:00)
    PART 3  Daily pick: continuous_push_campaign_send_today + controls (daily, after 2)
    PART 4  After Tania's process has sent: write sent rows to ledger (daily, after send)
    PART 5  Checks
@@ -34,6 +34,10 @@ USE ROLE ACCOUNTADMIN;
 
 SET daily_n        = 100;     -- treated sends per day (control adds roughly the same again)
 SET cooldown_days  = 7;      -- selection cooldown in days (same as the 7-day spam guard)
+SET max_prior_click_share = 0.2;  -- at most this share of each day's picks may be people who clicked an
+                                  -- earlier discount link (the procedures use this number as written here)
+SET max_prev_sent_share  = 0.3;   -- at most this share of each day's picks may be people who were already
+                                  -- DELIVERED a discount WhatsApp in the last 180 days (any campaign, incl. MMM)
 -- model_version is read from CPC_MODEL_REGISTRY at the start of Part 2 (the current champion)
 
 
@@ -328,7 +332,7 @@ WHERE arm = 'treated' AND selected_date >= DATEADD('day', -7, CURRENT_DATE) AND 
 
 
 -- SEND_NOW: what Make should read. Same rows as SEND_TODAY, minus anyone who has BOUGHT since the
--- 10:30 pick (policy created, golden sale, or a Sale Made call outcome), re-checked every time Make
+-- 10:00 pick (policy created, golden sale, or a Sale Made call outcome), re-checked every time Make
 -- queries it (a view recomputes on every read). Only today's list, only rows not yet sent.
 -- Every row comes from SEND_TODAY (one row per phone), so the view can never return duplicates.
 CREATE OR REPLACE VIEW PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.CONTINUOUS_PUSH_CAMPAIGN_SEND_NOW AS
@@ -708,6 +712,7 @@ cooldown AS (      -- CHANGE 4 + 5: selection cooldown, September send, 7-day sp
     ) WHERE HAS_BEEN_MESSAGED = TRUE AND DATEADD('day', $cooldown_days, '2026-09-16'::DATE) >= CURRENT_DATE
     UNION
     SELECT phone9 FROM PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.CONTINUOUS_PUSH_CAMPAIGN_DO_NOT_MESSAGE_7D
+
 ),
 feat AS (
     SELECT p.*,
@@ -860,11 +865,25 @@ WITH already AS (
     SELECT DISTINCT phone9 FROM PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.CONTINUOUS_PUSH_CAMPAIGN_HISTORY
     WHERE selected_date = CURRENT_DATE
 ),
-fresh AS (
-    SELECT a.*, ROW_NUMBER() OVER (ORDER BY a.p_click DESC, a.phone9) AS rank_on_day
-    FROM PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.CONTINUOUS_PUSH_CAMPAIGN_AUDIENCE a
-    WHERE a.selectable
-    QUALIFY ROW_NUMBER() OVER (ORDER BY a.p_click DESC, a.phone9) <= 2 * $daily_n
+fresh AS (       -- top 2 x daily_n by score, with two caps:
+                 --   previous clickers               <= max_prior_click_share of the picks
+                 --   previously sent a discount msg  <= max_prev_sent_share   of the picks (clickers included)
+    SELECT c.*, ROW_NUMBER() OVER (ORDER BY c.p_click DESC, c.phone9) AS rank_on_day
+    FROM (
+        SELECT b.*
+        FROM (
+            SELECT a.*
+            FROM PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.CONTINUOUS_PUSH_CAMPAIGN_AUDIENCE a
+            WHERE a.selectable
+            QUALIFY a.f_prior_click <> 'yes'
+                 OR ROW_NUMBER() OVER (PARTITION BY a.f_prior_click ORDER BY a.p_click DESC, a.phone9)
+                    <= FLOOR(2 * $daily_n * $max_prior_click_share)
+        ) b
+        QUALIFY b.f_disc_msg_age = 'none'
+             OR ROW_NUMBER() OVER (PARTITION BY (b.f_disc_msg_age = 'none') ORDER BY b.p_click DESC, b.phone9)
+                <= FLOOR(2 * $daily_n * $max_prev_sent_share)
+    ) c
+    QUALIFY ROW_NUMBER() OVER (ORDER BY c.p_click DESC, c.phone9) <= 2 * $daily_n
 ),
 reused AS (
     SELECT a.*, ROW_NUMBER() OVER (ORDER BY a.p_click DESC, a.phone9) AS rank_on_day

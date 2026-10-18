@@ -4,9 +4,9 @@
    Run this whole file ONCE in a Snowflake worksheet, step by step (see the numbered
    STEP headers). After that Snowflake runs the daily audience by itself:
 
-     MMM_DAILY_PICK_TASK     10:30 Mon-Sat (SAST)  -> Parts 2+3: score everyone, pick today's
+     MMM_DAILY_PICK_TASK     10:00 Mon-Fri (SAST)  -> Parts 2+3: score everyone, pick today's
                                                        people, log picks, fill SEND_TODAY
-     MMM_CONFIRM_SENDS_TASK  18:00 Mon-Sat (SAST)  -> Part 4: log the rows the send process
+     MMM_CONFIRM_SENDS_TASK  18:00 Mon-Fri (SAST)  -> Part 4: log the rows the send process
                                                        marked has_been_messaged = TRUE, then
                                                        delete those rows from SEND_TODAY
 
@@ -15,7 +15,7 @@
    procedures pick the change up.
 
    Python is only used for the monthly retrain (MMM_auto_retrain.py). It writes new weights +
-   a new champion into CPC_MODEL_REGISTRY, and the next 10:30 run scores with it automatically.
+   a new champion into CPC_MODEL_REGISTRY, and the next 10:00 run scores with it automatically.
    ===================================================================================== */
 
 USE ROLE ACCOUNTADMIN;
@@ -406,6 +406,7 @@ cooldown AS (
     ) WHERE HAS_BEEN_MESSAGED = TRUE AND DATEADD(''day'', ' || P_COOLDOWN_DAYS::VARCHAR || ', ''2026-09-16''::DATE) >= CURRENT_DATE
     UNION
     SELECT phone9 FROM PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.CONTINUOUS_PUSH_CAMPAIGN_DO_NOT_MESSAGE_7D
+
 ),
 feat AS (
     SELECT p.*,
@@ -557,11 +558,25 @@ WITH already AS (
     SELECT DISTINCT phone9 FROM PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.CONTINUOUS_PUSH_CAMPAIGN_HISTORY
     WHERE selected_date = CURRENT_DATE
 ),
-fresh AS (
-    SELECT a.*, ROW_NUMBER() OVER (ORDER BY a.p_click DESC, a.phone9) AS rank_on_day
-    FROM PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.CONTINUOUS_PUSH_CAMPAIGN_AUDIENCE a
-    WHERE a.selectable
-    QUALIFY ROW_NUMBER() OVER (ORDER BY a.p_click DESC, a.phone9) <= 2 * ' || P_DAILY_N::VARCHAR || '
+fresh AS (       
+                 
+                 
+    SELECT c.*, ROW_NUMBER() OVER (ORDER BY c.p_click DESC, c.phone9) AS rank_on_day
+    FROM (
+        SELECT b.*
+        FROM (
+            SELECT a.*
+            FROM PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.CONTINUOUS_PUSH_CAMPAIGN_AUDIENCE a
+            WHERE a.selectable
+            QUALIFY a.f_prior_click <> ''yes''
+                 OR ROW_NUMBER() OVER (PARTITION BY a.f_prior_click ORDER BY a.p_click DESC, a.phone9)
+                    <= FLOOR(2 * ' || P_DAILY_N::VARCHAR || ' * 0.2)
+        ) b
+        QUALIFY b.f_disc_msg_age = ''none''
+             OR ROW_NUMBER() OVER (PARTITION BY (b.f_disc_msg_age = ''none'') ORDER BY b.p_click DESC, b.phone9)
+                <= FLOOR(2 * ' || P_DAILY_N::VARCHAR || ' * 0.3)
+    ) c
+    QUALIFY ROW_NUMBER() OVER (ORDER BY c.p_click DESC, c.phone9) <= 2 * ' || P_DAILY_N::VARCHAR || '
 ),
 reused AS (
     SELECT a.*, ROW_NUMBER() OVER (ORDER BY a.p_click DESC, a.phone9) AS rank_on_day
@@ -680,7 +695,7 @@ FROM PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.CONTINUOUS_PUSH_CAMPAIGN_AUDIENCE GR
    ------------------------------------------------------------------------------------- */
 CREATE OR REPLACE TASK PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.MMM_DAILY_PICK_TASK
     WAREHOUSE = COMPUTE_WH
-    SCHEDULE = 'USING CRON 30 10 * * MON-SAT Africa/Johannesburg'
+    SCHEDULE = 'USING CRON 0 10 * * MON-FRI Africa/Johannesburg'
     USER_TASK_TIMEOUT_MS = 3600000          -- give up after 1 hour
     COMMENT = 'MMM: score + pick today''s continuous-campaign audience into SEND_TODAY'
 AS
@@ -688,7 +703,7 @@ AS
 
 CREATE OR REPLACE TASK PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.MMM_CONFIRM_SENDS_TASK
     WAREHOUSE = COMPUTE_WH
-    SCHEDULE = 'USING CRON 0 18 * * MON-SAT Africa/Johannesburg'
+    SCHEDULE = 'USING CRON 0 18 * * MON-FRI Africa/Johannesburg'
     USER_TASK_TIMEOUT_MS = 1800000
     COMMENT = 'MMM: log confirmed sends from SEND_TODAY into the ledger'
 AS
@@ -723,7 +738,7 @@ ORDER BY scheduled_time DESC;
 -- WHERE name IN ('MMM_DAILY_PICK_TASK', 'MMM_CONFIRM_SENDS_TASK')
 -- ORDER BY scheduled_time DESC LIMIT 100;
 
--- Run today's pick right now instead of waiting for 10:30 (e.g. after fixing a failure):
+-- Run today's pick right now instead of waiting for 10:00 (e.g. after fixing a failure):
 -- EXECUTE TASK PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.MMM_DAILY_PICK_TASK;
 
 -- Pause (e.g. over December) / restart:
