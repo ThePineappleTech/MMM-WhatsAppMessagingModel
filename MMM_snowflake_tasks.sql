@@ -432,6 +432,14 @@ cooldown AS (
         UNION ALL SELECT FORMATTED_CONTACT_NUMBER_2 AS p FROM PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.RE_ENGAGED_90_DAYS
     ) always_on
     WHERE LENGTH(REGEXP_REPLACE(COALESCE(p, ''''), ''[^0-9]'', '''')) >= 9
+    UNION
+    
+    
+    SELECT RIGHT(REGEXP_REPLACE(SPLIT_PART(w.NUMBER::STRING, ''.'', 1), ''[^0-9]'', ''''), 9)
+    FROM TWILIO_DATABASE.DATA.WHATSAPPTEMPLATEDATA w
+    JOIN TWILIO_DATABASE.DATA.MESSAGES m ON m.SID = w.MESSAGE_SID
+    WHERE m.ERROR_CODE IN (63003, 63024)
+      AND m.DATE_SENT >= DATEADD(''day'', -180, SYSDATE())
 ),
 feat AS (
     SELECT p.*,
@@ -559,7 +567,8 @@ SELECT
     ROUND(1 / (1 + EXP(-(i.b_click + z.z_click))), 5)                                         AS p_click_if_delivered,
     ROUND(1 / (1 + EXP(-(i.b_deliver + z.z_deliver))) * 1 / (1 + EXP(-(i.b_click + z.z_click))), 6) AS p_click,
     f.phone_first, f.in_cooldown,
-    (NOT f.phone_first AND NOT f.in_cooldown) AS selectable,
+    (NOT f.phone_first AND NOT f.in_cooldown
+     AND REGEXP_LIKE(f.phone9, ''[67][0-9]{8}|8[1-4][0-9]{7}'')) AS selectable,   
     f.f_segment, f.f_lead_age, f.f_quote_age, f.f_call_age, f.f_callback_age, f.f_last_outcome,
     f.f_calls_30d, f.f_lead_type, f.f_leads_30d, f.f_last_source, f.f_first_source, f.f_first_all,
     f.f_wa_delivered, f.f_wa_failed, f.f_wa_read_rate, f.f_wa_replied, f.f_prior_click, f.f_premium, f.f_dialer_ch,
@@ -578,10 +587,7 @@ CROSS JOIN icpt i';
     END IF;
 
     -- ===== PART 3: pick today's people, log every pick, build SEND_TODAY =====
-    -- today's volume: treated people with p_click >= min_p_click, between min_daily_n and P_DAILY_N
-    SELECT LEAST(P_DAILY_N, GREATEST(100,
-           COUNT_IF(selectable AND arm = 'treated' AND p_click >= 0.015)))
-    INTO :n_today FROM PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.CONTINUOUS_PUSH_CAMPAIGN_AUDIENCE;
+    n_today := P_DAILY_N;
 
     -- part 3 statement 1: CREATE OR REPLACE TABLE PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.CONTINU...
     stmt := 'CREATE OR REPLACE TABLE PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.CONTINUOUS_PUSH_CAMPAIGN_PICKED_TODAY AS
@@ -589,37 +595,76 @@ WITH already AS (
     SELECT DISTINCT phone9 FROM PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.CONTINUOUS_PUSH_CAMPAIGN_HISTORY
     WHERE selected_date = CURRENT_DATE
 ),
-fresh AS (       
+pool AS (        
                  
                  
-    SELECT c.*, ROW_NUMBER() OVER (ORDER BY c.p_click DESC, c.phone9) AS rank_on_day
-    FROM (
-        SELECT b.*
-        FROM (
-            SELECT a.*
-            FROM PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.CONTINUOUS_PUSH_CAMPAIGN_AUDIENCE a
-            WHERE a.selectable
-            QUALIFY a.f_prior_click <> ''yes''
-                 OR ROW_NUMBER() OVER (PARTITION BY a.f_prior_click ORDER BY a.p_click DESC, a.phone9)
-                    <= FLOOR(2 * ' || N_TODAY::VARCHAR || ' * 0.2)
-        ) b
-        QUALIFY b.f_disc_msg_age = ''none''
-             OR ROW_NUMBER() OVER (PARTITION BY (b.f_disc_msg_age = ''none'') ORDER BY b.p_click DESC, b.phone9)
-                <= FLOOR(2 * ' || N_TODAY::VARCHAR || ' * 0.3)
-    ) c
-    QUALIFY ROW_NUMBER() OVER (ORDER BY c.p_click DESC, c.phone9) <= 2 * ' || N_TODAY::VARCHAR || '
+    SELECT a.*,
+           (a.f_lead_age IN (''0-3d'', ''4-7d'') AND a.f_disc_msg_age = ''none'' AND a.f_prior_click <> ''yes''
+            AND a.p_click >= 0.005) AS is_fresh
+    FROM PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.CONTINUOUS_PUSH_CAMPAIGN_AUDIENCE a
+    WHERE a.selectable
+),
+t_fresh AS (     
+    SELECT * FROM pool
+    WHERE arm = ''treated'' AND is_fresh
+    QUALIFY ROW_NUMBER() OVER (ORDER BY p_click DESC, phone9) <= ' || N_TODAY::VARCHAR || '
+),
+t_best AS (      
+    SELECT b.* FROM (
+        SELECT p.* FROM pool p
+        WHERE p.arm = ''treated'' AND NOT p.is_fresh
+        QUALIFY p.f_prior_click <> ''yes''
+             OR ROW_NUMBER() OVER (PARTITION BY p.f_prior_click ORDER BY p.p_click DESC, p.phone9)
+                <= FLOOR(' || N_TODAY::VARCHAR || ' * 0.2)
+    ) b
+    QUALIFY b.f_disc_msg_age = ''none''
+         OR ROW_NUMBER() OVER (PARTITION BY (b.f_disc_msg_age = ''none'') ORDER BY b.p_click DESC, b.phone9)
+            <= FLOOR(' || N_TODAY::VARCHAR || ' * 0.3)
+),
+t_best_ranked AS (
+    SELECT t.*, ROW_NUMBER() OVER (ORDER BY t.p_click DESC, t.phone9) AS rn_best FROM t_best t
+),
+t_best_top AS (  
+    SELECT r.* EXCLUDE (rn_best)
+    FROM t_best_ranked r
+    CROSS JOIN (SELECT COUNT(*) AS n_fresh FROM t_fresh) f
+    WHERE r.rn_best <= ' || N_TODAY::VARCHAR || ' - f.n_fresh
+),
+cutoff AS (      
+    SELECT COALESCE(MIN(p_click), 1) AS min_best FROM t_best_top
+),
+c_candidates AS (
+                 
+    SELECT p.*, MOD(ABS(HASH(p.phone9, ''cpc_control_order_v1'', CURRENT_DATE)), 1000000) AS rnd
+    FROM pool p CROSS JOIN cutoff k
+    WHERE p.arm = ''control'' AND (p.is_fresh OR p.p_click >= k.min_best)
+),
+c_capped AS (    
+    SELECT b.* FROM (
+        SELECT c.* FROM c_candidates c
+        QUALIFY c.f_prior_click <> ''yes''
+             OR ROW_NUMBER() OVER (PARTITION BY c.f_prior_click ORDER BY c.rnd, c.phone9)
+                <= FLOOR(50 * 0.2)
+    ) b
+    QUALIFY b.f_disc_msg_age = ''none''
+         OR ROW_NUMBER() OVER (PARTITION BY (b.f_disc_msg_age = ''none'') ORDER BY b.rnd, b.phone9)
+            <= FLOOR(50 * 0.3)
+),
+c_pick AS (      
+    SELECT * EXCLUDE (rnd) FROM c_capped
+    QUALIFY ROW_NUMBER() OVER (ORDER BY rnd, phone9) <= 50
+),
+new_picks AS (   
+    SELECT u.* EXCLUDE (is_fresh), ROW_NUMBER() OVER (ORDER BY u.p_click DESC, u.phone9) AS rank_on_day
+    FROM (SELECT * FROM t_fresh UNION ALL SELECT * FROM t_best_top UNION ALL SELECT * FROM c_pick) u
 ),
 reused AS (
     SELECT a.*, ROW_NUMBER() OVER (ORDER BY a.p_click DESC, a.phone9) AS rank_on_day
     FROM PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.CONTINUOUS_PUSH_CAMPAIGN_AUDIENCE a
     WHERE a.phone9 IN (SELECT phone9 FROM already)
 )
-SELECT f.*, CURRENT_DATE AS selected_date FROM fresh f
+SELECT f.*, CURRENT_DATE AS selected_date FROM new_picks f
 WHERE NOT EXISTS (SELECT 1 FROM already)
-  
-  
-  AND (f.arm = ''treated''
-       OR MOD(ABS(HASH(f.phone9, ''cpc_control_keep_v1'')), 10000) < 10000 * LEAST(1, 100 / ' || N_TODAY::VARCHAR || '))
 UNION ALL
 SELECT r.*, CURRENT_DATE FROM reused r';
     EXECUTE IMMEDIATE :stmt;
@@ -736,7 +781,7 @@ CREATE OR REPLACE TASK PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.MMM_DAILY_PICK_TAS
     USER_TASK_TIMEOUT_MS = 3600000          -- give up after 1 hour
     COMMENT = 'MMM: score + pick today''s continuous-campaign audience into SEND_TODAY'
 AS
-    CALL PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.MMM_DAILY_PICK(400, 7, FALSE);
+    CALL PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.MMM_DAILY_PICK(200, 7, FALSE);
 
 CREATE OR REPLACE TASK PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.MMM_CONFIRM_SENDS_TASK
     WAREHOUSE = COMPUTE_WH
