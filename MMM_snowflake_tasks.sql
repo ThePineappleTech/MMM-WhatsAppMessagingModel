@@ -49,6 +49,7 @@ DECLARE
     n_eligible  NUMBER;
     n_select    NUMBER;
     n_send      NUMBER;
+    n_today     NUMBER;
 BEGIN
     -- current champion model from the registry
     SELECT model_version INTO :mv FROM PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.CPC_MODEL_REGISTRY
@@ -181,7 +182,7 @@ psm AS (
     QUALIFY ROW_NUMBER() OVER (PARTITION BY MOTOR_QUOTE_NO ORDER BY TRY_TO_TIMESTAMP_NTZ(UPDATEDAT) DESC NULLS LAST) = 1
 ),
 q2s_eligible AS (
-    SELECT q.phone9, q.quote_no,
+    SELECT q.phone9, q.USER_ID, q.quote_no,
            DATEDIFF(''day'', q.quote_anchor_ts, CURRENT_DATE) AS days_since_quote,
            nm.first_name, nm.last_name,
            dp.pre_disc_quote_premium AS pre_prem, dp.post_disc_quote_premium AS last_prem,
@@ -219,7 +220,7 @@ q2s_priced AS (
     WHERE e.prior_disc IS NOT NULL
 ),
 q2s_final AS (
-    SELECT phone9, IFF(days_since_quote <= 45, ''Q2S_LT45'', ''Q2S_GT45'') AS audience,
+    SELECT phone9, USER_ID::VARCHAR AS user_id, IFF(days_since_quote <= 45, ''Q2S_LT45'', ''Q2S_GT45'') AS audience,
            first_name, last_name, vehicle_make, vehicle_model,
            pre_prem, last_prem, prior_disc, psm_rmd, offer_pct,
            ROUND(pre_prem * (1 - offer_pct / 100.0), 2) AS new_premium_offered
@@ -251,7 +252,7 @@ lead_latest AS (
     QUALIFY ROW_NUMBER() OVER (PARTITION BY phone9 ORDER BY lead_ts DESC) = 1
 ),
 l2s_final AS (
-    SELECT ll.phone9, ''L2S'' AS audience, ll.first_name, ll.last_name,
+    SELECT ll.phone9, ll.user_id::VARCHAR AS user_id, ''L2S'' AS audience, ll.first_name, ll.last_name,
            NULL::VARCHAR AS vehicle_make, NULL::VARCHAR AS vehicle_model,
            NULL::FLOAT AS pre_prem, NULL::FLOAT AS last_prem, 0::FLOAT AS prior_disc, NULL::FLOAT AS psm_rmd,
            10 AS offer_pct, NULL::FLOAT AS new_premium_offered
@@ -543,6 +544,7 @@ icpt AS (
 )
 SELECT
     f.first_name, f.last_name, ''+27'' || f.phone9 AS phone_number, f.phone9,
+    f.user_id,
     f.audience,
     IFF(MOD(ABS(HASH(f.phone9, ''cpc_holdout_v1'')), 2) = 0, ''treated'', ''control'') AS arm,
     ROUND(f.prior_disc, 2)            AS prior_discount_percentage,
@@ -576,6 +578,11 @@ CROSS JOIN icpt i';
     END IF;
 
     -- ===== PART 3: pick today's people, log every pick, build SEND_TODAY =====
+    -- today's volume: treated people with p_click >= min_p_click, between min_daily_n and P_DAILY_N
+    SELECT LEAST(P_DAILY_N, GREATEST(100,
+           COUNT_IF(selectable AND arm = 'treated' AND p_click >= 0.015)))
+    INTO :n_today FROM PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.CONTINUOUS_PUSH_CAMPAIGN_AUDIENCE;
+
     -- part 3 statement 1: CREATE OR REPLACE TABLE PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.CONTINU...
     stmt := 'CREATE OR REPLACE TABLE PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.CONTINUOUS_PUSH_CAMPAIGN_PICKED_TODAY AS
 WITH already AS (
@@ -594,20 +601,25 @@ fresh AS (
             WHERE a.selectable
             QUALIFY a.f_prior_click <> ''yes''
                  OR ROW_NUMBER() OVER (PARTITION BY a.f_prior_click ORDER BY a.p_click DESC, a.phone9)
-                    <= FLOOR(2 * ' || P_DAILY_N::VARCHAR || ' * 0.2)
+                    <= FLOOR(2 * ' || N_TODAY::VARCHAR || ' * 0.2)
         ) b
         QUALIFY b.f_disc_msg_age = ''none''
              OR ROW_NUMBER() OVER (PARTITION BY (b.f_disc_msg_age = ''none'') ORDER BY b.p_click DESC, b.phone9)
-                <= FLOOR(2 * ' || P_DAILY_N::VARCHAR || ' * 0.3)
+                <= FLOOR(2 * ' || N_TODAY::VARCHAR || ' * 0.3)
     ) c
-    QUALIFY ROW_NUMBER() OVER (ORDER BY c.p_click DESC, c.phone9) <= 2 * ' || P_DAILY_N::VARCHAR || '
+    QUALIFY ROW_NUMBER() OVER (ORDER BY c.p_click DESC, c.phone9) <= 2 * ' || N_TODAY::VARCHAR || '
 ),
 reused AS (
     SELECT a.*, ROW_NUMBER() OVER (ORDER BY a.p_click DESC, a.phone9) AS rank_on_day
     FROM PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.CONTINUOUS_PUSH_CAMPAIGN_AUDIENCE a
     WHERE a.phone9 IN (SELECT phone9 FROM already)
 )
-SELECT f.*, CURRENT_DATE AS selected_date FROM fresh f WHERE NOT EXISTS (SELECT 1 FROM already)
+SELECT f.*, CURRENT_DATE AS selected_date FROM fresh f
+WHERE NOT EXISTS (SELECT 1 FROM already)
+  
+  
+  AND (f.arm = ''treated''
+       OR MOD(ABS(HASH(f.phone9, ''cpc_control_keep_v1'')), 10000) < 10000 * LEAST(1, 100 / ' || N_TODAY::VARCHAR || '))
 UNION ALL
 SELECT r.*, CURRENT_DATE FROM reused r';
     EXECUTE IMMEDIATE :stmt;
@@ -638,7 +650,8 @@ SELECT p.first_name, p.last_name, p.phone_number,
        p.premium_without_any_discounts, p.last_quoted_premium, p.new_premium_offered,
        p.vehicle_make, p.vehicle_model,
        FALSE AS has_been_messaged,                    
-       CURRENT_DATE AS selected_date                  
+       CURRENT_DATE AS selected_date,                 
+       p.user_id                                      
 FROM PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.CONTINUOUS_PUSH_CAMPAIGN_PICKED_TODAY p
 WHERE p.arm = ''treated''
   AND p.phone9 NOT IN (SELECT phone9 FROM PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.CONTINUOUS_PUSH_CAMPAIGN_DO_NOT_MESSAGE_7D)
@@ -646,7 +659,7 @@ ORDER BY p.rank_on_day';
     EXECUTE IMMEDIATE :stmt;
 
     SELECT COUNT(*) INTO :n_send FROM PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.CONTINUOUS_PUSH_CAMPAIGN_SEND_TODAY;
-    RETURN 'OK: model ' || mv || ', eligible ' || n_eligible || ', selectable ' || n_select
+    RETURN 'OK: model ' || mv || ', today''s volume ' || n_today || ', eligible ' || n_eligible || ', selectable ' || n_select
            || ', SEND_TODAY rows ' || n_send;
 END;
 $$;
@@ -723,7 +736,7 @@ CREATE OR REPLACE TASK PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.MMM_DAILY_PICK_TAS
     USER_TASK_TIMEOUT_MS = 3600000          -- give up after 1 hour
     COMMENT = 'MMM: score + pick today''s continuous-campaign audience into SEND_TODAY'
 AS
-    CALL PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.MMM_DAILY_PICK(100, 7, FALSE);
+    CALL PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.MMM_DAILY_PICK(400, 7, FALSE);
 
 CREATE OR REPLACE TASK PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.MMM_CONFIRM_SENDS_TASK
     WAREHOUSE = COMPUTE_WH

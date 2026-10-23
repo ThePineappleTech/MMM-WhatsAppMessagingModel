@@ -32,10 +32,14 @@
 
 USE ROLE ACCOUNTADMIN;
 
-SET daily_n        = 100;     -- treated sends per day (control adds roughly the same again)
+SET max_daily_n    = 400;     -- most people to message in a day (the task's first number overrides this)
+SET min_daily_n    = 100;     -- fewest people to message in a day, even if few clear min_p_click
+SET min_p_click    = 0.015;   -- message everyone (treated) whose predicted click chance is at least this,
+                              -- between min_daily_n and max_daily_n -> the daily volume follows pool quality
 SET cooldown_days  = 7;      -- selection cooldown in days (same as the 7-day spam guard)
 SET max_prior_click_share = 0.2;  -- at most this share of each day's picks may be people who clicked an
                                   -- earlier discount link (the procedures use this number as written here)
+SET control_n = 100;              -- control group size per day (~); treated = daily_n (~). Written into the procedure.
 SET max_prev_sent_share  = 0.3;   -- at most this share of each day's picks may be people who were already
                                   -- DELIVERED a discount WhatsApp in the last 180 days (any campaign, incl. MMM)
 -- model_version is read from CPC_MODEL_REGISTRY at the start of Part 2 (the current champion)
@@ -350,7 +354,9 @@ WITH bought AS (
     JOIN connex_db.data.cxm_outcomes o ON o.id = i.outcome_id
     WHERE o.name ILIKE '%sale made%'
 )
-SELECT t.*
+SELECT t.first_name, t.last_name, t.phone_number, t.audience, t.offered_discount_percentage,
+       t.top_up_percentage, t.premium_without_any_discounts, t.last_quoted_premium, t.new_premium_offered,
+       t.vehicle_make, t.vehicle_model, t.has_been_messaged, t.selected_date, t.user_id
 FROM PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.CONTINUOUS_PUSH_CAMPAIGN_SEND_TODAY t
 WHERE t.selected_date = CURRENT_DATE
   AND t.has_been_messaged = FALSE
@@ -487,7 +493,7 @@ psm AS (
     QUALIFY ROW_NUMBER() OVER (PARTITION BY MOTOR_QUOTE_NO ORDER BY TRY_TO_TIMESTAMP_NTZ(UPDATEDAT) DESC NULLS LAST) = 1
 ),
 q2s_eligible AS (
-    SELECT q.phone9, q.quote_no,
+    SELECT q.phone9, q.USER_ID, q.quote_no,
            DATEDIFF('day', q.quote_anchor_ts, CURRENT_DATE) AS days_since_quote,
            nm.first_name, nm.last_name,
            dp.pre_disc_quote_premium AS pre_prem, dp.post_disc_quote_premium AS last_prem,
@@ -525,7 +531,7 @@ q2s_priced AS (
     WHERE e.prior_disc IS NOT NULL
 ),
 q2s_final AS (
-    SELECT phone9, IFF(days_since_quote <= 45, 'Q2S_LT45', 'Q2S_GT45') AS audience,
+    SELECT phone9, USER_ID::VARCHAR AS user_id, IFF(days_since_quote <= 45, 'Q2S_LT45', 'Q2S_GT45') AS audience,
            first_name, last_name, vehicle_make, vehicle_model,
            pre_prem, last_prem, prior_disc, psm_rmd, offer_pct,
            ROUND(pre_prem * (1 - offer_pct / 100.0), 2) AS new_premium_offered
@@ -557,7 +563,7 @@ lead_latest AS (
     QUALIFY ROW_NUMBER() OVER (PARTITION BY phone9 ORDER BY lead_ts DESC) = 1
 ),
 l2s_final AS (
-    SELECT ll.phone9, 'L2S' AS audience, ll.first_name, ll.last_name,
+    SELECT ll.phone9, ll.user_id::VARCHAR AS user_id, 'L2S' AS audience, ll.first_name, ll.last_name,
            NULL::VARCHAR AS vehicle_make, NULL::VARCHAR AS vehicle_model,
            NULL::FLOAT AS pre_prem, NULL::FLOAT AS last_prem, 0::FLOAT AS prior_disc, NULL::FLOAT AS psm_rmd,
            10 AS offer_pct, NULL::FLOAT AS new_premium_offered
@@ -849,6 +855,7 @@ icpt AS (
 )
 SELECT
     f.first_name, f.last_name, '+27' || f.phone9 AS phone_number, f.phone9,
+    f.user_id,
     f.audience,
     IFF(MOD(ABS(HASH(f.phone9, 'cpc_holdout_v1')), 2) = 0, 'treated', 'control') AS arm,
     ROUND(f.prior_disc, 2)            AS prior_discount_percentage,
@@ -884,6 +891,12 @@ CROSS JOIN icpt i;
      people, so an accidental re-run can never double the day's volume.
    ===================================================================================== */
 
+-- Today's volume: everyone (treated side) with p_click >= min_p_click, but at least min_daily_n
+-- and at most max_daily_n. The stored procedure computes the same number (see build-tasks).
+SET daily_n = (SELECT LEAST($max_daily_n, GREATEST($min_daily_n,
+                      COUNT_IF(selectable AND arm = 'treated' AND p_click >= $min_p_click)))
+               FROM PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.CONTINUOUS_PUSH_CAMPAIGN_AUDIENCE);
+
 CREATE OR REPLACE TABLE PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.CONTINUOUS_PUSH_CAMPAIGN_PICKED_TODAY AS
 WITH already AS (
     SELECT DISTINCT phone9 FROM PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.CONTINUOUS_PUSH_CAMPAIGN_HISTORY
@@ -914,7 +927,12 @@ reused AS (
     FROM PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.CONTINUOUS_PUSH_CAMPAIGN_AUDIENCE a
     WHERE a.phone9 IN (SELECT phone9 FROM already)
 )
-SELECT f.*, CURRENT_DATE AS selected_date FROM fresh f WHERE NOT EXISTS (SELECT 1 FROM already)
+SELECT f.*, CURRENT_DATE AS selected_date FROM fresh f
+WHERE NOT EXISTS (SELECT 1 FROM already)
+  -- control is a random subset of the same top-ranked people, sized to ~control_n per day
+  -- (a fixed second hash, so it's comparable to treated and the same people are kept every time)
+  AND (f.arm = 'treated'
+       OR MOD(ABS(HASH(f.phone9, 'cpc_control_keep_v1')), 10000) < 10000 * LEAST(1, $control_n / $daily_n))
 UNION ALL
 SELECT r.*, CURRENT_DATE FROM reused r;
 
@@ -943,7 +961,8 @@ SELECT p.first_name, p.last_name, p.phone_number,
        p.premium_without_any_discounts, p.last_quoted_premium, p.new_premium_offered,
        p.vehicle_make, p.vehicle_model,
        FALSE AS has_been_messaged,                    -- the send process flips this after sending
-       CURRENT_DATE AS selected_date                  -- Make: only send if this is today's date
+       CURRENT_DATE AS selected_date,                 -- Make: only send if this is today's date
+       p.user_id                                      -- Q2S: the governing quote's user; L2S: the latest lead's user
 FROM PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.CONTINUOUS_PUSH_CAMPAIGN_PICKED_TODAY p
 WHERE p.arm = 'treated'
   AND p.phone9 NOT IN (SELECT phone9 FROM PINEAPPLE_DATABASE.MESSAGING_AUDIENCES.CONTINUOUS_PUSH_CAMPAIGN_DO_NOT_MESSAGE_7D)
